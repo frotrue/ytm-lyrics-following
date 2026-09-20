@@ -1,0 +1,30 @@
+{
+  "name": "ytm-lyrics-following",
+  "version": "0.1.1",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/frotrue/ytm-lyrics-following.git"
+  },
+  "type": "module",
+  "description": "Synced lyrics in the YouTube Music lyrics tab",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test",
+    "check": "npm run test && npm run build",
+    "lint:extension": "web-ext lint --source-dir dist/firefox --warnings-as-errors",
+    "package": "npm run build && web-ext build --source-dir dist/firefox --artifacts-dir artifacts/firefox --overwrite-dest && web-ext build --source-dir dist/chromium --artifacts-dir artifacts/chromium --overwrite-dest"
+  },
+  "overrides": {
+    "image-size": "^2.0.4"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "jsdom": "^26.0.0",
+    "web-ext": "^10.6.0"
+  }
+}

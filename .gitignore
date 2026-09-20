@@ -1,0 +1,10 @@
+node_modules/
+dist/
+artifacts/
+output/
+.playwright-cli/
+.codegraph/
+*.log
+.env
+.env.*
+!.env.example

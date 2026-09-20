@@ -18,6 +18,10 @@ const TIME_TAG_RE = /\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]/g;
 const OFFSET_TAG_RE = /\[offset\s*:\s*([+-]?\d+(?:\.\d+)?)\s*\]/gi;
 const METADATA_TAG_RE = /\[(?:ar|al|ti|by|re|ve|length|id)\s*:[^\]]*\]/gi;
 const CACHEABLE_STATUSES = new Set(['synced', 'plain', 'instrumental', 'missing']);
+const RETRYABLE_HTTP_STATUSES = new Set([429, 502, 503, 504]);
+const DEFAULT_MAX_RETRIES = 2;
+const DEFAULT_RETRY_DELAY_MS = 1_000;
+const DEFAULT_MAX_RETRY_DELAY_MS = 2_000;
 
 function finiteNumber(value) {
   if (typeof value === 'boolean' || value === null || value === undefined) return null;
@@ -294,6 +298,47 @@ export async function fetchJsonWithTimeout(url, options = {}) {
   }
 }
 
+function retryAfterMs(response) {
+  const header = response?.headers?.get?.('retry-after')
+    ?? response?.headers?.get?.('Retry-After');
+  if (typeof header !== 'string' || !header.trim()) return null;
+  const value = header.trim();
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : null;
+}
+
+function defaultSleep(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function fetchProviderJson(url, options = {}) {
+  const maxRetries = Number.isFinite(options.maxRetries)
+    ? Math.max(0, Math.floor(options.maxRetries))
+    : DEFAULT_MAX_RETRIES;
+  const maxRetryDelayMs = Number.isFinite(options.maxRetryDelayMs)
+    ? Math.max(0, options.maxRetryDelayMs)
+    : DEFAULT_MAX_RETRY_DELAY_MS;
+  const sleep = typeof options.sleep === 'function' ? options.sleep : defaultSleep;
+
+  for (let attempt = 0; ; attempt += 1) {
+    const result = await fetchJsonWithTimeout(url, options);
+    const status = result.response.status;
+    if (!RETRYABLE_HTTP_STATUSES.has(status) || attempt >= maxRetries) return result;
+
+    const retryAfter = retryAfterMs(result.response);
+    const configuredDelay = typeof options.retryDelayMs === 'function'
+      ? options.retryDelayMs(attempt + 1, result.response)
+      : Number.isFinite(options.retryDelayMs)
+        ? options.retryDelayMs * (2 ** attempt)
+        : DEFAULT_RETRY_DELAY_MS * (2 ** attempt);
+    const fallbackDelay = Number.isFinite(configuredDelay) ? Math.max(0, configuredDelay) : DEFAULT_RETRY_DELAY_MS;
+    const delay = Math.min(maxRetryDelayMs, Math.max(0, retryAfter ?? fallbackDelay));
+    await sleep(delay);
+  }
+}
+
 async function providerLookup(track, options = {}) {
   const query = {
     track_name: track.title,
@@ -304,7 +349,7 @@ async function providerLookup(track, options = {}) {
 
   let getResult;
   try {
-    const getResponse = await fetchJsonWithTimeout(queryUrl('/get', query), options);
+    const getResponse = await fetchProviderJson(queryUrl('/get', query), options);
     if (getResponse.response.status === 404) {
       getResult = { status: 'missing' };
     } else if (!getResponse.response.ok) {
@@ -324,7 +369,7 @@ async function providerLookup(track, options = {}) {
 
   let searchResponse;
   try {
-    searchResponse = await fetchJsonWithTimeout(queryUrl('/search', query), options);
+    searchResponse = await fetchProviderJson(queryUrl('/search', query), options);
   } catch (error) {
     throw error;
   }
@@ -358,6 +403,10 @@ export function createLyricsService(options = {}) {
     fetchImpl: options.fetchImpl ?? globalThis.fetch,
     storage,
     timeoutMs: Number.isFinite(options.timeoutMs) ? options.timeoutMs : DEFAULT_TIMEOUT_MS,
+    maxRetries: Number.isFinite(options.maxRetries) ? options.maxRetries : DEFAULT_MAX_RETRIES,
+    retryDelayMs: options.retryDelayMs,
+    maxRetryDelayMs: Number.isFinite(options.maxRetryDelayMs) ? options.maxRetryDelayMs : DEFAULT_MAX_RETRY_DELAY_MS,
+    sleep: options.sleep,
     successTtlMs: Number.isFinite(options.successTtlMs) ? options.successTtlMs : DEFAULT_SUCCESS_TTL_MS,
     negativeTtlMs: Number.isFinite(options.negativeTtlMs) ? options.negativeTtlMs : DEFAULT_NEGATIVE_TTL_MS,
     cacheLimit: Number.isFinite(options.cacheLimit) ? Math.max(1, Math.floor(options.cacheLimit)) : DEFAULT_CACHE_LIMIT,

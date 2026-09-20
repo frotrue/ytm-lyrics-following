@@ -44,7 +44,11 @@ export class LyricsContentController {
     this.window = window;
     this.runtime = runtime;
     this.adapter = adapter || new YouTubeMusicAdapter({ document, window, onInvalidate: () => this.refresh() });
-    this.panel = panel || new LyricsPanel({ document, window, onSeek: (time) => this.seekTo(time) });
+    this.panel = panel || new LyricsPanel({
+      document, window,
+      onSeek: (time) => this.seekTo(time),
+      onRetry: () => this.retryLyrics(),
+    });
     this.clockIntervalMs = clockIntervalMs;
     this.metadataSettleMs = metadataSettleMs;
     this._requestSequence = 0;
@@ -139,6 +143,12 @@ export class LyricsContentController {
       return { status: 'error', message: 'Extension messaging is unavailable.' };
     }
     return this.runtime.sendMessage({ type: REQUEST_TYPE, track });
+  }
+
+  retryLyrics() {
+    if (!this._started) return;
+    this._cancelOutstandingWork();
+    return this.refresh();
   }
 
   _updateClock() {

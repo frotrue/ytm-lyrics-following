@@ -33,6 +33,8 @@ const CSS = `
   .empty.plain-state { display: block; max-height: min(64vh, 620px); min-height: 260px; overflow-y: auto; }
   .empty-title { color: #f0f0f2; font-size: 21px; font-weight: 700; }
   .empty-copy { color: var(--muted); font-size: 14px; line-height: 1.5; margin-top: 9px; max-width: 30rem; }
+  .retry { justify-self: center; margin-top: 20px; padding: 10px 18px; border: 1px solid #777; border-radius: 999px; background: transparent; color: #fff; font: inherit; font-size: 14px; cursor: pointer; }
+  .retry:hover, .retry:focus-visible { background: #333; outline: 2px solid #ddd; outline-offset: 2px; }
   .plain { white-space: pre-wrap; color: #d6d6da; font-size: 17px; line-height: 1.55; margin-top: 20px; text-align: left; }
   :host([data-ytm-artwork-aligned]) .panel { height: 100%; min-height: 0; max-height: 100%; }
   :host([data-ytm-artwork-aligned]) .empty { min-height: 0; }
@@ -62,6 +64,8 @@ function visibleRect(element) {
 }
 
 function statusCopy(status, message) {
+  const temporaryStatus = status === 'error' && message?.match(/\bHTTP (429|502|503|504)\b/);
+  if (temporaryStatus) return `The lyrics server is temporarily unavailable (HTTP ${temporaryStatus[1]}). Please try again shortly.`;
   if (message) return message;
   switch (status) {
     case 'loading': return 'Looking for timed lyrics for this track.';
@@ -85,11 +89,12 @@ function statusTitle(status) {
 
 /** A self-contained Shadow DOM surface. Dynamic values are always text nodes. */
 export class LyricsPanel {
-  constructor({ document = globalThis.document, window = globalThis.window, followPauseMs = 5500, onSeek = () => {} } = {}) {
+  constructor({ document = globalThis.document, window = globalThis.window, followPauseMs = 5500, onSeek = () => {}, onRetry = () => {} } = {}) {
     this.document = document;
     this.window = window;
     this.followPauseMs = followPauseMs;
     this.onSeek = typeof onSeek === 'function' ? onSeek : () => {};
+    this.onRetry = typeof onRetry === 'function' ? onRetry : () => {};
     this.root = null;
     this.shadow = null;
     this.scroll = null;
@@ -242,6 +247,20 @@ export class LyricsPanel {
       if (this.data.status === 'plain') empty.classList.add('plain-state');
       empty.append(makeElement(this.document, 'empty-title', statusTitle(this.data.status)));
       empty.append(makeElement(this.document, 'empty-copy', statusCopy(this.data.status, this.data.message)));
+      if (this.data.status === 'error') {
+        const retry = this.document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'retry';
+        retry.textContent = 'Retry';
+        retry.addEventListener('click', () => this.onRetry());
+        retry.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') event.stopPropagation();
+        });
+        retry.addEventListener('keyup', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') event.stopPropagation();
+        });
+        empty.append(retry);
+      }
       if (this.data.status === 'plain' && this.data.plainLyrics) {
         empty.append(makeElement(this.document, 'plain', this.data.plainLyrics));
       }

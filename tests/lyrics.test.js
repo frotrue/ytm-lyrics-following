@@ -62,6 +62,78 @@ test('service uses /get, falls back to a uniquely matching /search result, and c
   assert.ok(storageState.lyricsCacheV1);
 });
 
+test('service retries a transient 503 and returns the recovered lyrics', async () => {
+  let calls = 0;
+  const delays = [];
+  const fetchImpl = async () => {
+    calls += 1;
+    if (calls === 1) return response(503, {});
+    return response(200, {
+      track_name: track.title,
+      artist_name: track.artist,
+      album_name: track.album,
+      duration: track.duration,
+      syncedLyrics: '[00:01.00]recovered',
+    });
+  };
+  const service = createLyricsService({
+    fetchImpl,
+    storage: null,
+    sleep: async (delay) => { delays.push(delay); },
+    retryDelayMs: 0,
+  });
+
+  const result = await service.getLyrics(track);
+  assert.equal(result.status, 'synced');
+  assert.equal(calls, 2);
+  assert.deepEqual(delays, [0]);
+});
+
+test('exhausted transient responses return an error and are not cached', async () => {
+  let calls = 0;
+  const service = createLyricsService({
+    fetchImpl: async () => { calls += 1; return response(503, {}); },
+    storage: null,
+    sleep: async () => {},
+    retryDelayMs: 0,
+  });
+
+  const result = await service.getLyrics(track);
+  assert.equal(result.status, 'error');
+  assert.match(result.message, /HTTP 503/);
+  assert.equal(calls, 3); // initial attempt plus two bounded retries
+  assert.equal(service.getCacheSnapshot().size, 0);
+});
+
+test('Retry-After is honored but capped', async () => {
+  const delays = [];
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ...response(503, {}),
+        headers: { get: () => '10' },
+      };
+    }
+    return response(200, {
+      track_name: track.title,
+      artist_name: track.artist,
+      duration: track.duration,
+      syncedLyrics: '[00:01.00]ready',
+    });
+  };
+  const service = createLyricsService({
+    fetchImpl,
+    storage: null,
+    maxRetryDelayMs: 1200,
+    sleep: async (delay) => { delays.push(delay); },
+  });
+
+  assert.equal((await service.getLyrics(track)).status, 'synced');
+  assert.deepEqual(delays, [1200]);
+});
+
 test('Promise storage APIs receive only their declared argument', async () => {
   const saved = {};
   const storage = {

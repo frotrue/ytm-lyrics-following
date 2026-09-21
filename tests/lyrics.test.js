@@ -56,7 +56,9 @@ test('service uses /get, falls back to a uniquely matching /search result, and c
   const second = await service.getLyrics(track);
   assert.equal(first.status, 'synced');
   assert.deepEqual(second, first);
+  // A unique exact synced search hit avoids unnecessary broader requests.
   assert.equal(calls.length, 2);
+  assert.equal(new Set(calls).size, 2);
   assert.match(calls[0], /track_name=Example\+Song/);
   assert.match(calls[0], /duration=120/);
   assert.ok(storageState.lyricsCacheV1);
@@ -204,6 +206,6 @@ test('negative results use a short cache and malformed tracks are rejected', asy
   });
   assert.equal((await service.getLyrics(track)).status, 'missing');
   assert.equal((await service.getLyrics(track)).status, 'missing');
-  assert.equal(calls, 2); // /get and /search on the first request, then cache hit
+  assert.equal(calls, 4); // /get and three distinct searches, then a cache hit
   assert.equal((await service.getLyrics({ title: '   ', artist: 'A' })).status, 'error');
 });

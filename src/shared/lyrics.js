@@ -14,6 +14,14 @@ export const DEFAULT_NEGATIVE_TTL_MS = 10 * 60 * 1000;
 export const DEFAULT_CACHE_LIMIT = 100;
 export const DEFAULT_CACHE_BYTES = 1_500_000;
 
+const DURATION_TOLERANCE_SECONDS = 2;
+const MAX_SEARCH_REQUESTS = 5;
+/**
+ * Bumped whenever candidate matching or the search plan changes shape.  Older
+ * plain/missing cache entries are dropped on load so a repaired matcher is not
+ * masked by a stale negative result; synced and instrumental entries stay.
+ */
+const MATCH_POLICY_VERSION = 2;
 const TIME_TAG_RE = /\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]/g;
 const OFFSET_TAG_RE = /\[offset\s*:\s*([+-]?\d+(?:\.\d+)?)\s*\]/gi;
 const METADATA_TAG_RE = /\[(?:ar|al|ti|by|re|ve|length|id)\s*:[^\]]*\]/gi;
@@ -125,51 +133,192 @@ function candidateDuration(candidate) {
   return finiteNumber(candidate?.duration);
 }
 
-/**
- * Conservative candidate check.  Version qualifiers remain part of the
- * normalized title, so an album version cannot silently match the studio
- * track.  If both records have durations, they must be close.
- */
-export function matchCandidate(candidate, track, durationTolerance = 2) {
-  if (!candidate || !track) return false;
-  const title = normalizeMatchText(track.title);
-  const artist = normalizeMatchText(track.artist);
-  if (!title || !artist) return false;
-  if (normalizeMatchText(candidateTitle(candidate)) !== title) return false;
-  if (normalizeMatchText(candidateArtist(candidate)) !== artist) return false;
-
-  const expectedDuration = finiteNumber(track.duration);
-  const actualDuration = candidateDuration(candidate);
-  if (expectedDuration !== null && actualDuration !== null) {
-    if (Math.abs(expectedDuration - actualDuration) > durationTolerance) return false;
-  }
-  return true;
+function candidateAlbum(candidate) {
+  return candidate?.album_name ?? candidate?.albumName ?? candidate?.album;
 }
 
 /**
- * Select a unique, high-confidence search result.  A tie is rejected rather
- * than resolved by array order, preventing an arbitrary duplicate from being
- * shown to the user.
+ * Words that describe a version, edit, or participant rather than an
+ * alternate name.  A bracket group made only of these words is never treated
+ * as an alias, so "(Live)", "(리믹스)", or "feat. X" cannot erase a qualifier.
  */
-export function selectSearchCandidate(candidates, track) {
-  if (!Array.isArray(candidates)) return null;
-  const matches = candidates.filter((candidate) => matchCandidate(candidate, track));
-  if (matches.length === 0) return null;
+const VERSION_QUALIFIER_TOKENS = new Set([
+  'live', 'remix', 'remixed', 'mix', 'acoustic', 'unplugged', 'instrumental',
+  'inst', 'karaoke', 'demo', 'remaster', 'remastered', 'version', 'ver',
+  'edit', 'edition', 'radio', 'extended', 'original', 'cover', 'bonus',
+  'track', 'deluxe', 'mono', 'stereo', 'sped', 'slowed', 'reprise',
+  'session', 'sessions', 'practice', 'ost', 'bgm',
+  '라이브', '리믹스', '어쿠스틱', '반주', '버전', '편곡', '커버', '데모',
+  '리마스터', '연주', '노래방', '원곡', '축소', '확장', '가사',
+]);
 
+const COLLABORATION_TOKENS = new Set([
+  'feat', 'ft', 'featuring', 'with', 'prod', 'produced', 'and', 'vs', 'duet',
+  '피처링', '듀엣',
+]);
+
+function tokenizeForQualifier(raw) {
+  return raw.normalize('NFKC').toLocaleLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+
+function hasQualifierOrCollaboration(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return true;
+  const text = raw.normalize('NFKC');
+  if (/[&+,;/×]/.test(text)) return true;
+  return tokenizeForQualifier(text).some((token) => (
+    VERSION_QUALIFIER_TOKENS.has(token) || COLLABORATION_TOKENS.has(token)
+      || /^(?:라이브|리믹스|어쿠스틱|리마스터|연주|노래방)버전$/u.test(token)
+  ));
+}
+
+function scriptOfName(text) {
+  const composed = text.normalize('NFKC');
+  const latin = /\p{Script=Latin}/u.test(composed);
+  const hangul = /\p{Script=Hangul}/u.test(composed);
+  if (latin && !hangul) return 'latin';
+  if (hangul && !latin) return 'hangul';
+  return null;
+}
+
+const ALIAS_PAIR_RE = /^([^()\[\]{}]+?)\s*(?:\(([^()\[\]{}]+)\)|\[([^()\[\]{}]+)\])$/;
+
+/**
+ * Read an explicit pairing such as "Oort Cloud (오르트구름)" or "YOUNHA (윤하)".
+ * Only one trailing bracket group, only two clearly different scripts, and no
+ * version or collaboration wording qualify.  Everything else returns null and
+ * falls back to a whole-string comparison, so no name is ever guessed.
+ */
+function parseAliasPair(raw) {
+  if (typeof raw !== 'string') return null;
+  const text = raw.normalize('NFKC').trim();
+  if (!text) return null;
+  const match = ALIAS_PAIR_RE.exec(text);
+  if (!match) return null;
+  const outer = match[1].trim();
+  const inner = (match[2] ?? match[3]).trim();
+  if (!outer || !inner) return null;
+  const outerScript = scriptOfName(outer);
+  const innerScript = scriptOfName(inner);
+  if (!outerScript || !innerScript || outerScript === innerScript) return null;
+  if (hasQualifierOrCollaboration(outer) || hasQualifierOrCollaboration(inner)) return null;
+  return { parts: [outer, inner] };
+}
+
+function sameNameSet(left, right) {
+  const a = [...new Set(left)].sort();
+  const b = [...new Set(right)].sort();
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/**
+ * Compare one metadata name.  'exact' means the normalized whole strings are
+ * equal, 'alias' means an explicit bilingual pairing connects the two sides,
+ * and 'none' rejects everything else.  Transliteration is never guessed.
+ */
+function compareName(candidateRaw, trackRaw) {
+  const candidateText = normalizeMatchText(candidateRaw);
+  const trackText = normalizeMatchText(trackRaw);
+  if (!candidateText || !trackText) return 'none';
+  if (candidateText === trackText) return 'exact';
+
+  const candidatePair = parseAliasPair(candidateRaw);
+  const trackPair = parseAliasPair(trackRaw);
+  if (!candidatePair && !trackPair) return 'none';
+
+  const candidateParts = (candidatePair ? candidatePair.parts : [candidateRaw]).map(normalizeMatchText);
+  const trackParts = (trackPair ? trackPair.parts : [trackRaw]).map(normalizeMatchText);
+  if (candidateParts.some((part) => !part) || trackParts.some((part) => !part)) return 'none';
+
+  if (candidatePair && trackPair) {
+    // Two pairings must correspond on both names; sharing one bracketed word
+    // is not enough.
+    return sameNameSet(candidateParts, trackParts) ? 'alias' : 'none';
+  }
+  const single = candidatePair ? trackText : candidateText;
+  const pairParts = candidatePair ? candidateParts : trackParts;
+  return pairParts.includes(single) ? 'alias' : 'none';
+}
+
+/**
+ * Conservative candidate check.  Version qualifiers remain part of the
+ * normalized title, so an album version cannot silently match the studio
+ * track.  An explicit bilingual alias is weaker evidence: it is accepted only
+ * when both records carry a real, close duration.
+ */
+function candidateMatch(candidate, track, durationTolerance = DURATION_TOLERANCE_SECONDS) {
+  if (!candidate || !track) return null;
+  const titleConfidence = compareName(candidateTitle(candidate), track.title);
+  if (titleConfidence === 'none') return null;
+  const artistConfidence = compareName(candidateArtist(candidate), track.artist);
+  if (artistConfidence === 'none') return null;
+
+  const expectedDuration = finiteNumber(track.duration);
+  const actualDuration = candidateDuration(candidate);
+  const exact = titleConfidence === 'exact' && artistConfidence === 'exact';
+  if (exact) {
+    if (expectedDuration !== null && actualDuration !== null
+      && Math.abs(expectedDuration - actualDuration) > durationTolerance) return null;
+  } else {
+    if (expectedDuration === null || actualDuration === null) return null;
+    if (expectedDuration <= 0 || actualDuration <= 0) return null;
+    if (Math.abs(expectedDuration - actualDuration) > durationTolerance) return null;
+  }
+  return {
+    confidence: exact ? 'exact' : 'alias',
+    titleExact: titleConfidence === 'exact',
+    artistExact: artistConfidence === 'exact',
+  };
+}
+
+/** Report how a candidate matched: 'exact', 'alias', or 'none'. */
+export function compareCandidate(candidate, track, durationTolerance = DURATION_TOLERANCE_SECONDS) {
+  const match = candidateMatch(candidate, track, durationTolerance);
+  return match ? match.confidence : 'none';
+}
+
+export function matchCandidate(candidate, track, durationTolerance = DURATION_TOLERANCE_SECONDS) {
+  return candidateMatch(candidate, track, durationTolerance) !== null;
+}
+
+function scoreCandidate(candidate, track, durationTolerance = DURATION_TOLERANCE_SECONDS) {
+  const match = candidateMatch(candidate, track, durationTolerance);
+  if (!match) return null;
   const expectedDuration = finiteNumber(track?.duration);
-  const scored = matches.map((candidate, index) => {
-    const actualDuration = candidateDuration(candidate);
-    const durationScore = expectedDuration !== null && actualDuration !== null
-      ? 2 - Math.min(1, Math.abs(expectedDuration - actualDuration) / Math.max(expectedDuration, 1))
-      : 0;
-    const albumScore = normalizeMatchText(candidate?.album_name ?? candidate?.albumName ?? candidate?.album) === normalizeMatchText(track?.album)
-      ? 0.25
-      : 0;
-    return { candidate, score: durationScore + albumScore, index };
+  const actualDuration = candidateDuration(candidate);
+  const durationScore = expectedDuration !== null && actualDuration !== null
+    ? 2 - Math.min(1, Math.abs(expectedDuration - actualDuration) / Math.max(expectedDuration, 1))
+    : 0;
+  const album = normalizeMatchText(track?.album);
+  const albumScore = album && normalizeMatchText(candidateAlbum(candidate)) === album ? 0.25 : 0;
+  // Confidence tiers outrank every duration and album term, so an exact title
+  // and artist never loses to a closer but merely aliased record.
+  const confidenceBonus = match.titleExact && match.artistExact
+    ? 6
+    : (match.titleExact || match.artistExact ? 3 : 0);
+  return { candidate, score: confidenceBonus + durationScore + albumScore, match };
+}
+
+function pickUniqueTop(scored) {
+  if (!Array.isArray(scored) || scored.length === 0) return null;
+  const sorted = [...scored].sort((a, b) => b.score - a.score || a.index - b.index);
+  if (sorted.length > 1 && Math.abs(sorted[0].score - sorted[1].score) < 1e-9) return null;
+  return sorted[0];
+}
+
+/**
+ * Select a unique, high-confidence search result.  Exact title and artist win
+ * first, alias degree comes next, and duration/album only separate candidates
+ * inside a tier.  A tie is rejected rather than resolved by array order.
+ */
+export function selectSearchCandidate(candidates, track, durationTolerance = DURATION_TOLERANCE_SECONDS) {
+  if (!Array.isArray(candidates)) return null;
+  const scored = [];
+  candidates.forEach((candidate, index) => {
+    const entry = scoreCandidate(candidate, track, durationTolerance);
+    if (entry) scored.push({ ...entry, index });
   });
-  scored.sort((a, b) => b.score - a.score || a.index - b.index);
-  if (scored.length > 1 && Math.abs(scored[0].score - scored[1].score) < 1e-9) return null;
-  return scored[0].candidate;
+  const top = pickUniqueTop(scored);
+  return top ? top.candidate : null;
 }
 
 export function normalizeTrack(track) {
@@ -339,45 +488,139 @@ async function fetchProviderJson(url, options = {}) {
   }
 }
 
-async function providerLookup(track, options = {}) {
-  const query = {
-    track_name: track.title,
-    artist_name: track.artist,
-  };
+function providerId(candidate) {
+  const raw = candidate?.id ?? candidate?.trackId ?? null;
+  if (raw === null || raw === undefined) return null;
+  const value = String(raw).trim();
+  return value === '' ? null : value;
+}
+
+/**
+ * Merge results from several searches.  Only the same provider id reappearing
+ * is collapsed; different ids stay apart so a genuine tie is still rejected.
+ * One id appearing with conflicting metadata is dropped entirely rather than
+ * trusting an arbitrary copy.
+ */
+function collectCandidates(collected, conflicted, candidates) {
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+    const serialized = JSON.stringify([
+      candidateTitle(candidate), candidateArtist(candidate), candidateAlbum(candidate),
+      candidateDuration(candidate), candidate.instrumental === true,
+      candidate.syncedLyrics ?? '', candidate.plainLyrics ?? '',
+    ]);
+    const id = providerId(candidate);
+    const key = id === null ? `raw:${serialized}` : `id:${id}`;
+    if (conflicted.has(key)) continue;
+    const existing = collected.get(key);
+    if (!existing) {
+      collected.set(key, { serialized, candidate });
+    } else if (existing.serialized !== serialized) {
+      collected.delete(key);
+      conflicted.add(key);
+    }
+  }
+}
+
+function getQueryParams(track) {
+  const query = { track_name: track.title, artist_name: track.artist };
   if (track.album) query.album_name = track.album;
   if (finiteNumber(track.duration) !== null) query.duration = finiteNumber(track.duration);
+  return query;
+}
 
-  let getResult;
-  try {
-    const getResponse = await fetchProviderJson(queryUrl('/get', query), options);
-    if (getResponse.response.status === 404) {
-      getResult = { status: 'missing' };
-    } else if (!getResponse.response.ok) {
-      throw new Error(`Lyrics service unavailable: HTTP ${getResponse.response.status}`);
-    } else if (!getResponse.payload || typeof getResponse.payload !== 'object' || Array.isArray(getResponse.payload)) {
-      throw new Error('Lyrics service returned an invalid payload');
-    } else if (!matchCandidate(getResponse.payload, track)) {
-      getResult = { status: 'missing' };
-    } else {
-      getResult = resultFromPayload(getResponse.payload);
+/**
+ * Bounded, deduplicated search plan: the exact metadata first, then the album
+ * condition removed, then the title alone, then each side of an explicit
+ * bilingual title so a composite artist record can still be found.  Every
+ * result is validated against the original track, so widening the query never
+ * widens acceptance.
+ */
+function buildSearchSteps(track) {
+  const steps = [];
+  const seen = new Set();
+  const add = (params) => {
+    if (steps.length >= MAX_SEARCH_REQUESTS) return;
+    const url = queryUrl('/search', params);
+    const key = url.toString();
+    if (seen.has(key)) return;
+    seen.add(key);
+    steps.push(url);
+  };
+  const base = { track_name: track.title, artist_name: track.artist };
+  if (track.album) add({ ...base, album_name: track.album });
+  add(base);
+  add({ track_name: track.title });
+  const pair = parseAliasPair(track.title);
+  if (pair) for (const part of pair.parts) add({ track_name: part });
+  return steps;
+}
+
+async function providerLookup(track, options = {}) {
+  const durationTolerance = Number.isFinite(options.durationTolerance)
+    ? options.durationTolerance
+    : DURATION_TOLERANCE_SECONDS;
+
+  // Exact metadata first; a synced or instrumental hit is returned at once.
+  let plainFallback = null;
+  const getResponse = await fetchProviderJson(queryUrl('/get', getQueryParams(track)), options);
+  if (getResponse.response.status === 404) {
+    // No exact record; the bounded search below takes over.
+  } else if (!getResponse.response.ok) {
+    throw new Error(`Lyrics service unavailable: HTTP ${getResponse.response.status}`);
+  } else if (!getResponse.payload || typeof getResponse.payload !== 'object' || Array.isArray(getResponse.payload)) {
+    throw new Error('Lyrics service returned an invalid payload');
+  } else if (candidateMatch(getResponse.payload, track, durationTolerance)) {
+    const getResult = resultFromPayload(getResponse.payload);
+    if (getResult.status === 'synced' || getResult.status === 'instrumental') return getResult;
+    if (getResult.status === 'plain') plainFallback = getResult;
+  }
+
+  const collected = new Map();
+  const conflicted = new Set();
+  const getPlainFallback = plainFallback;
+  let ranked = [];
+  for (const url of buildSearchSteps(track)) {
+    let searchResponse;
+    try {
+      searchResponse = await fetchProviderJson(url, options);
+    } catch (error) {
+      // A plain result already satisfies the request, and a failure is never
+      // followed by more requests against the service.
+      if (plainFallback) return plainFallback;
+      throw error;
     }
-  } catch (error) {
-    throw error;
+    if (searchResponse.response.status === 404) continue;
+    if (!searchResponse.response.ok) {
+      if (plainFallback) return plainFallback;
+      throw new Error(`Lyrics service unavailable: HTTP ${searchResponse.response.status}`);
+    }
+    if (!Array.isArray(searchResponse.payload)) {
+      if (plainFallback) return plainFallback;
+      throw new Error('Lyrics service returned an invalid search payload');
+    }
+    collectCandidates(collected, conflicted, searchResponse.payload);
+    ranked = [];
+    for (const { candidate } of collected.values()) {
+      const entry = scoreCandidate(candidate, track, durationTolerance);
+      if (entry) ranked.push({ ...entry, index: ranked.length, result: resultFromPayload(candidate) });
+    }
+    const top = pickUniqueTop(ranked);
+    // Keep a uniquely validated plain search result if a later request fails.
+    // Recompute it after every response so conflicts or ties cannot preserve
+    // a previously selected arbitrary record.
+    plainFallback = getPlainFallback || (top?.result?.status === 'plain' ? top.result : null);
+    if (top?.match.confidence === 'exact' && top.result?.status === 'synced') return top.result;
   }
 
-  if (getResult.status !== 'missing') return getResult;
-
-  let searchResponse;
-  try {
-    searchResponse = await fetchProviderJson(queryUrl('/search', query), options);
-  } catch (error) {
-    throw error;
+  if (plainFallback) {
+    // Only a validated synced record may replace a working plain result.
+    const synced = pickUniqueTop(ranked.filter((entry) => entry.result?.status === 'synced'));
+    return synced ? synced.result : plainFallback;
   }
-  if (searchResponse.response.status === 404) return { status: 'missing' };
-  if (!searchResponse.response.ok) throw new Error(`Lyrics service unavailable: HTTP ${searchResponse.response.status}`);
-  if (!Array.isArray(searchResponse.payload)) throw new Error('Lyrics service returned an invalid search payload');
-  const selected = selectSearchCandidate(searchResponse.payload, track);
-  return selected ? resultFromPayload(selected) : { status: 'missing' };
+  const top = pickUniqueTop(ranked);
+  if (!top || top.result?.status === 'missing') return { status: 'missing' };
+  return top.result;
 }
 
 /** Perform one uncached LRCLIB lookup, useful for callers and unit tests. */
@@ -428,7 +671,19 @@ export function createLyricsService(options = {}) {
           for (const [key, value] of Object.entries(entries)) {
             if (!value || !Number.isFinite(value.expiresAt) || value.expiresAt <= now()) continue;
             const result = sanitizeResult(value.result);
-            if (result) cache.set(key, { expiresAt: value.expiresAt, savedAt: Number(value.savedAt) || 0, result });
+            if (!result) continue;
+            const policy = Number(value.policy);
+            const currentPolicy = Number.isFinite(policy) && policy === MATCH_POLICY_VERSION;
+            // A plain/missing entry written by an older matcher must not hide
+            // the repaired matching and search behavior.  Synced and
+            // instrumental entries carry no matching risk and are kept.
+            if (!currentPolicy && (result.status === 'plain' || result.status === 'missing')) continue;
+            cache.set(key, {
+              expiresAt: value.expiresAt,
+              savedAt: Number(value.savedAt) || 0,
+              policy: currentPolicy ? policy : null,
+              result,
+            });
           }
         }
       } catch {
@@ -455,7 +710,12 @@ export function createLyricsService(options = {}) {
     const sanitized = sanitizeResult(result);
     if (!sanitized) return;
     const ttl = sanitized.status === 'missing' ? config.negativeTtlMs : config.successTtlMs;
-    const entry = { expiresAt: now() + Math.max(0, ttl), savedAt: now(), result: sanitized };
+    const entry = {
+      expiresAt: now() + Math.max(0, ttl),
+      savedAt: now(),
+      policy: MATCH_POLICY_VERSION,
+      result: sanitized,
+    };
     if (JSON.stringify({ [key]: entry }).length > config.cacheBytes) return;
     cache.set(key, entry);
     const ordered = [...cache.entries()].sort((a, b) => a[1].savedAt - b[1].savedAt);

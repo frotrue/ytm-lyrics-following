@@ -125,6 +125,12 @@ export class LyricsContentController {
     // Verify all three pieces of identity after awaiting: lifecycle, track, and
     // mount. YouTube Music frequently changes them independently during SPA navigation.
     if (!this._started || sequence !== this._requestSequence || key !== this._trackKey) return;
+    // The DOM/media may already have advanced before the adapter's batched
+    // notification runs. Check the live metadata, not just the last request key.
+    if (trackIdentity(this.adapter.getTrack()) !== key) {
+      this.refresh();
+      return;
+    }
     const currentHost = this.adapter.getLyricsHost();
     if (!currentHost || !this.adapter.isLyricsHostCurrent(currentHost)) {
       this._cancelOutstandingWork();

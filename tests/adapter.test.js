@@ -76,3 +76,61 @@ test('adapter does not nominate a non-lyrics tab for replacement', () => {
 
   assert.equal(adapter.getLyricsHost(), null);
 });
+
+test('adapter detects player metadata updated in existing text nodes', async (t) => {
+  const dom = liveDom();
+  const changes = [];
+  const adapter = new YouTubeMusicAdapter({
+    document: dom.window.document,
+    window: dom.window,
+    debounceMs: 0,
+    fallbackMs: 60_000,
+    onInvalidate: () => changes.push(adapter.getTrack()),
+  });
+  t.after(() => { adapter.stop(); dom.window.close(); });
+  adapter.start();
+
+  const artist = dom.window.document.querySelector('a[href^="channel/"]');
+  artist.firstChild.data = 'Next artist';
+  await new Promise((resolve) => dom.window.setTimeout(resolve, 20));
+
+  assert.equal(changes.length, 1);
+  assert.equal(changes[0].artist, 'Next artist');
+});
+
+test('continuous player updates cannot postpone metadata invalidation indefinitely', async (t) => {
+  const dom = liveDom();
+  const scheduled = new Map();
+  let nextId = 0;
+  let now = 0;
+  // Run the real observer and media listeners against a deterministic timer queue.
+  const window = {
+    MutationObserver: dom.window.MutationObserver,
+    location: dom.window.location,
+    setTimeout(callback, delay) {
+      const id = ++nextId;
+      scheduled.set(id, { callback, at: now + delay });
+      return id;
+    },
+    clearTimeout(id) { scheduled.delete(id); },
+  };
+  let invalidations = 0;
+  const adapter = new YouTubeMusicAdapter({
+    document: dom.window.document, window, debounceMs: 20,
+    onInvalidate: () => { invalidations += 1; },
+  });
+  t.after(() => { adapter.stop(); dom.window.close(); });
+  adapter.start();
+  const media = dom.window.document.querySelector('video');
+  for (now = 0; now <= 100; now += 5) {
+    media.dispatchEvent(new dom.window.Event('durationchange'));
+    for (const [id, timer] of scheduled) {
+      if (timer.at <= now) {
+        scheduled.delete(id);
+        timer.callback();
+      }
+    }
+  }
+
+  assert.ok(invalidations > 0, 'metadata must refresh while events are still arriving');
+});

@@ -210,6 +210,9 @@ export class YouTubeMusicAdapter {
 
   _isRelevantMutation(mutation) {
     const relevant = (node) => {
+      // Polymer can update the existing title/byline Text node in place.
+      // characterData records target that node rather than its element.
+      if (node?.nodeType === 3) return relevant(node.parentElement);
       if (node?.nodeType !== 1) return false;
       const element = node;
       return element.matches?.('ytmusic-player-bar, ytmusic-tab-renderer, ytmusic-description-shelf-renderer, ytmusic-player, video, audio')
@@ -261,7 +264,9 @@ export class YouTubeMusicAdapter {
 
   _scheduleInvalidation(reason) {
     if (!this._started) return;
-    if (this._invalidateTimer != null) this.window?.clearTimeout?.(this._invalidateTimer);
+    // Coalesce a burst without letting continuous player updates starve it.
+    // The controller separately waits for stable track metadata before lookup.
+    if (this._invalidateTimer != null) return;
     this._invalidateTimer = this.window?.setTimeout?.(() => {
       this._invalidateTimer = null;
       this.onInvalidate({ reason });

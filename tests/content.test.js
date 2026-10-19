@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import { LyricsContentController } from '../src/content.js';
 import { LyricsPanel, ROOT_ID } from '../src/content/panel.js';
+import { YouTubeMusicAdapter } from '../src/content/adapter.js';
 
 function deferred() {
   let resolve;
@@ -80,6 +81,92 @@ test('a late response for an old track cannot overwrite newer lyrics', async (t)
 
   assert.deepEqual(panel.data.lines, [{ time: 1, text: 'new line' }]);
   assert.equal(panel.shadow.querySelector('.line').textContent, 'new line');
+});
+
+test('a response arriving before track-change invalidation cannot render old lyrics', async (t) => {
+  const { dom, adapter, state } = fixture();
+  const requests = [];
+  const controller = new LyricsContentController({
+    document: dom.window.document, window: dom.window, adapter,
+    clockIntervalMs: 60_000, metadataSettleMs: 0,
+    runtime: { sendMessage: (message) => {
+      const request = deferred();
+      requests.push({ message, request });
+      return request.promise;
+    } },
+  });
+  t.after(() => { controller.stop(); dom.window.close(); });
+  controller.start();
+  await waitFor(() => requests.length === 1, dom.window, 'initial lyric request');
+
+  // The player has advanced, but the adapter's debounced notification has not fired.
+  state.track = { title: 'B', artist: 'Artist', id: 'video-b' };
+  requests[0].request.resolve({ status: 'synced', lines: [{ time: 1, text: 'old line' }] });
+  await new Promise((resolve) => dom.window.setTimeout(resolve, 0));
+  assert.equal(controller.panel.data.status, 'loading');
+  assert.equal(controller.panel.shadow.querySelector('.line'), null);
+
+  await waitFor(() => requests.length === 2, dom.window, 'current track lyric request');
+  assert.equal(requests[1].message.track.title, 'B');
+  requests[1].request.resolve({ status: 'synced', lines: [{ time: 1, text: 'new line' }] });
+  await waitFor(() => controller.panel.data.lines[0]?.text === 'new line', dom.window, 'current lyrics to render');
+});
+
+test('automatic track changes load new lyrics with a reused media element and replaced shelf', async (t) => {
+  const { dom, shelf } = fixture();
+  const document = dom.window.document;
+  document.body.insertAdjacentHTML('afterbegin', `
+    <ytmusic-player-bar>
+      <yt-formatted-string class="title ytmusic-player-bar">A</yt-formatted-string>
+      <yt-formatted-string class="byline ytmusic-player-bar"><a href="channel/test">Artist A</a></yt-formatted-string>
+    </ytmusic-player-bar>
+    <ytmusic-player><video></video></ytmusic-player>
+  `);
+  const media = document.querySelector('video');
+  Object.defineProperty(media, 'duration', { configurable: true, value: 180 });
+  const requests = [];
+  const adapter = new YouTubeMusicAdapter({
+    document, window: dom.window, debounceMs: 0, fallbackMs: 60_000,
+    onInvalidate: () => controller.refresh(),
+  });
+  const controller = new LyricsContentController({
+    document, window: dom.window, adapter,
+    metadataSettleMs: 15, clockIntervalMs: 60_000,
+    runtime: { sendMessage: async ({ track }) => {
+      requests.push(track);
+      return { status: 'synced', lines: [{ time: 1, text: `${track.title} lyrics` }] };
+    } },
+  });
+  t.after(() => { controller.stop(); dom.window.close(); });
+  controller.start();
+  await waitFor(() => controller.panel.data.lines[0]?.text === 'A lyrics', dom.window, 'initial lyrics');
+
+  dom.window.history.replaceState(null, '', '/watch?v=video-b');
+  document.querySelector('.title').firstChild.data = 'B';
+  document.querySelector('.byline a').firstChild.data = 'Artist B';
+  Object.defineProperty(media, 'duration', { configurable: true, value: 210 });
+  media.currentTime = 0;
+  media.dispatchEvent(new dom.window.Event('loadedmetadata'));
+  const replacement = shelf.cloneNode(false);
+  replacement.innerHTML = '<div>New native lyrics</div>';
+  shelf.replaceWith(replacement);
+
+  await waitFor(() => controller.panel.data.lines[0]?.text === 'B lyrics', dom.window, 'automatic next-track lyrics');
+  assert.deepEqual(requests, [
+    { title: 'A', artist: 'Artist A', duration: 180, id: 'video-a' },
+    { title: 'B', artist: 'Artist B', duration: 210, id: 'video-b' },
+  ]);
+  assert.equal(controller.panel.root.parentElement, replacement);
+  assert.equal(replacement.querySelector('div').hidden, true);
+  assert.equal(controller.panel.shadow.querySelector('.line').textContent, 'B lyrics');
+
+  // A same-length next song can update only the player-bar Text nodes.
+  dom.window.history.replaceState(null, '', '/watch?v=video-c');
+  document.querySelector('.title').firstChild.data = 'C';
+  document.querySelector('.byline a').firstChild.data = 'Artist C';
+  await waitFor(() => controller.panel.data.lines[0]?.text === 'C lyrics', dom.window, 'text-only next-track lyrics');
+  assert.equal(requests.length, 3);
+  assert.deepEqual(requests[2], { title: 'C', artist: 'Artist C', duration: 210, id: 'video-c' });
 });
 
 test('leaving the lyrics tab invalidates an in-flight response and re-entry starts a new request', async (t) => {
